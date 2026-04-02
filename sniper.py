@@ -27,10 +27,11 @@ from db import init_db, save_position, delete_position, load_open_positions
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 SECRET_PATH = Path.home() / ".secret" / "binance.txt"
+TELEGRAM_PATH = Path.home() / ".secret" / "telegram.txt"
 
 # Timing
-SCAN_INTERVAL = 10              # seconds between scans (when idle)
-PRESCAN_SECONDS = 60            # start watching candidates this many seconds before settlement
+SCAN_INTERVAL = 60              # seconds between scans (when idle, far from settlement)
+PRESCAN_SECONDS = 120           # start watching candidates this many seconds before settlement
 ENTRY_SECONDS_BEFORE = 2        # enter this many seconds before settlement
 EXIT_SECONDS_AFTER = 1          # exit this many seconds after settlement
 SAFETY_CHECK_INTERVAL = 120     # seconds between margin safety checks
@@ -52,6 +53,53 @@ def setup_logging():
 
 setup_logging()
 log = logging.getLogger("sniper")
+
+
+class TelegramNotifier:
+    """Send notifications via Telegram bot."""
+
+    def __init__(self):
+        self.bot_token = ""
+        self.chat_id = ""
+        self._load()
+
+    def _load(self):
+        if not TELEGRAM_PATH.exists():
+            return
+        for line in TELEGRAM_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                v = v.strip().strip("'\"")
+                k = k.strip()
+                if k == "BOT_TOKEN":
+                    self.bot_token = v
+                elif k == "BOT_CHAT_ID":
+                    self.chat_id = v
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.bot_token and self.chat_id)
+
+    async def send(self, message: str):
+        """Send a message. Non-blocking, never raises."""
+        if not self.enabled:
+            return
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            async with aiohttp.ClientSession() as session:
+                await session.post(url, data={
+                    "chat_id": self.chat_id,
+                    "text": message,
+                    "parse_mode": "HTML",
+                }, timeout=aiohttp.ClientTimeout(total=5))
+        except Exception as e:
+            log.warning(f"Telegram send failed: {e}")
+
+
+telegram = TelegramNotifier()
 
 
 def load_api_keys():
@@ -281,6 +329,11 @@ class FundingSniper:
             f"vol_1m={opp.get('volatility_1m', 0):.4%} "
             f"funding_in={opp['seconds_to_funding']}s"
         )
+        await telegram.send(
+            f"⚡ <b>SNIPE {direction.upper()}</b> {symbol}\n"
+            f"Rate: {opp['rate']:+.4%} | Net: {opp['net_pnl']:+.4%}\n"
+            f"Qty: {quantity:.4f} | ~${quantity * price:.2f}"
+        )
 
         if self.dry_run:
             self.positions[symbol] = {
@@ -306,6 +359,7 @@ class FundingSniper:
 
             if order.filled_qty <= 0 or order.avg_price <= 0:
                 log.error(f"[ENTER FAILED] {symbol}: not filled (qty={order.filled_qty})")
+                await telegram.send(f"🚨 <b>ENTER FAILED</b> {symbol}: order not filled")
                 return
 
             self.positions[symbol] = {
@@ -340,6 +394,7 @@ class FundingSniper:
 
         except Exception as e:
             log.error(f"[ENTER FAILED] {symbol}: {e}", exc_info=True)
+            await telegram.send(f"🚨 <b>ENTER FAILED</b> {symbol}: {e}")
 
     async def exit_snipe(self, symbol: str):
         """Exit a snipe position after funding settlement."""
@@ -378,10 +433,19 @@ class FundingSniper:
                 funding_pnl = abs(pos["rate"]) * pos["entry_price"] * quantity
                 total_fees = pos["entry_price"] * quantity * 0.0004 * 2  # taker both sides
 
+                net = price_pnl + funding_pnl - total_fees
                 log.info(
                     f"[CLOSED] {symbol}: price_pnl=${price_pnl:+.4f} "
                     f"funding~${funding_pnl:.4f} fees~${total_fees:.4f} "
-                    f"net~${price_pnl + funding_pnl - total_fees:+.4f}"
+                    f"net~${net:+.4f}"
+                )
+                emoji = "✅" if net > 0 else "⚠️"
+                await telegram.send(
+                    f"{emoji} <b>CLOSED</b> {symbol}\n"
+                    f"Price PnL: ${price_pnl:+.4f}\n"
+                    f"Funding:   ~${funding_pnl:.4f}\n"
+                    f"Fees:      ~${total_fees:.4f}\n"
+                    f"<b>Net: ${net:+.4f}</b>"
                 )
 
             delete_position(symbol)
@@ -389,6 +453,7 @@ class FundingSniper:
 
         except Exception as e:
             log.error(f"[EXIT FAILED] {symbol}: {e}", exc_info=True)
+            await telegram.send(f"🚨 <b>EXIT FAILED</b> {symbol}: {e}")
             # Retry once
             try:
                 await asyncio.sleep(2)
@@ -401,6 +466,11 @@ class FundingSniper:
                 log.info(f"[EXIT RETRY OK] {symbol}")
             except Exception as e2:
                 log.error(f"[EXIT RETRY FAILED] {symbol}: {e2} — MANUAL CLOSE NEEDED")
+                await telegram.send(
+                    f"🔴 <b>MANUAL CLOSE NEEDED</b> {symbol}\n"
+                    f"Exit failed twice: {e2}\n"
+                    f"Position still open on Binance!"
+                )
 
     async def check_exits(self):
         """Check if any positions should be exited (funding has settled)."""
@@ -428,9 +498,17 @@ class FundingSniper:
 
         await self.client.load_futures_symbols()
 
+        mode = "DRY RUN" if self.dry_run else "LIVE"
         if not self.dry_run:
             bal = await self.client.futures_balances()
-            log.info(f"Futures USDT: ${bal.get('USDT', 0):.2f}")
+            usdt = bal.get('USDT', 0)
+            log.info(f"Futures USDT: ${usdt:.2f}")
+            await telegram.send(
+                f"🟢 <b>Sniper started ({mode})</b>\n"
+                f"Balance: ${usdt:.2f} USDT\n"
+                f"Min rate: {self.min_rate:.1%} | Size: ${self.position_usdt}\n"
+                f"Window: T-{ENTRY_SECONDS_BEFORE}s → T+{EXIT_SECONDS_AFTER}s"
+            )
 
             # Recover any positions from crash
             saved = load_open_positions()
@@ -499,6 +577,10 @@ class FundingSniper:
                         maint = float(acct.get("totalMaintMargin", 0))
                         if margin_balance > 0 and maint / margin_balance > 0.8:
                             log.error(f"[DANGER] Margin ratio {maint/margin_balance:.2f}, closing all!")
+                            await telegram.send(
+                                f"🔴 <b>DANGER</b> Margin ratio {maint/margin_balance:.2f}\n"
+                                f"Emergency closing all positions!"
+                            )
                             for sym in list(self.positions.keys()):
                                 await self.exit_snipe(sym)
                     except Exception as e:
