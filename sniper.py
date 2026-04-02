@@ -100,6 +100,23 @@ class FundingSniper:
 
         self._last_safety = 0.0
 
+    async def _get_1m_volatility(self, symbol: str) -> float:
+        """Get average 1-minute price change over the last 30 minutes."""
+        try:
+            data = await self.client._futures_get("/fapi/v1/klines", {
+                "symbol": symbol, "interval": "1m", "limit": 30,
+            })
+            if not data or not isinstance(data, list):
+                return 999.0  # Unknown = assume dangerous
+            changes = []
+            for k in data:
+                o, c = float(k[1]), float(k[4])
+                if o > 0:
+                    changes.append(abs(c - o) / o)
+            return sum(changes) / len(changes) if changes else 999.0
+        except Exception:
+            return 999.0
+
     async def scan_opportunities(self) -> list[dict]:
         """Find symbols with extreme funding rates approaching settlement."""
         now_ms = int(time.time() * 1000)
@@ -150,6 +167,16 @@ class FundingSniper:
             if net_pnl <= 0:
                 continue
 
+            # Volatility filter: funding rate must be > 3x the avg 1-minute volatility
+            # This ensures we're not gambling on price swings larger than our edge
+            vol = await self._get_1m_volatility(symbol)
+            if abs_rate < vol * 3:
+                log.info(
+                    f"[VOL SKIP] {symbol}: rate={abs_rate:.4%} < 3x vol={vol:.4%} "
+                    f"(need {vol*3:.4%})"
+                )
+                continue
+
             opportunities.append({
                 "symbol": symbol,
                 "rate": rate,
@@ -158,6 +185,7 @@ class FundingSniper:
                 "mark_price": mark_price,
                 "next_funding": next_funding,
                 "seconds_to_funding": seconds_to_funding,
+                "volatility_1m": vol,
                 "net_pnl": net_pnl,
                 "volume": volume,
             })
@@ -188,6 +216,7 @@ class FundingSniper:
         log.info(
             f"[ENTER] {symbol} {direction} qty={quantity:.6f} price~{price:.4f} "
             f"rate={opp['rate']:+.4%} net={opp['net_pnl']:+.4%} "
+            f"vol_1m={opp.get('volatility_1m', 0):.4%} "
             f"funding_in={opp['seconds_to_funding']}s"
         )
 
