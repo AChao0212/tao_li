@@ -203,6 +203,17 @@ class BinanceClient:
     def get_futures_info(self, symbol: str) -> SymbolInfo | None:
         return self._futures_symbols.get(symbol)
 
+    async def load_margin_symbols(self) -> set[str]:
+        """Load symbols available for cross margin trading."""
+        data = await self._spot_get("/sapi/v1/margin/allPairs")
+        self._margin_symbols = {p["symbol"] for p in data if isinstance(p, dict)}
+        log.info(f"Loaded {len(self._margin_symbols)} margin symbols")
+        return self._margin_symbols
+
+    def is_margin_tradable(self, symbol: str) -> bool:
+        """Check if a symbol supports cross margin trading."""
+        return symbol in getattr(self, '_margin_symbols', set())
+
     # ─── Account ────────────────────────────────────────────────────────
 
     async def spot_balances(self) -> dict[str, float]:

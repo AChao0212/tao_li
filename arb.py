@@ -292,6 +292,7 @@ class ArbBot:
         await self.client.load_futures_symbols()
         if not self.dry_run:
             await self.client.load_spot_symbols()
+            await self.client.load_margin_symbols()
 
             # Recover any positions from previous run
             self.executor.recover_positions()

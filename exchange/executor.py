@@ -257,6 +257,10 @@ class HedgeExecutor:
             # Get borrow interest rate for negative direction
             borrow_rate = 0.0
             if direction == "negative":
+                # Check if symbol supports margin trading
+                if not self.client.is_margin_tradable(symbol):
+                    raise ValueError(f"{symbol} not available for margin trading")
+
                 base_asset = symbol.replace("USDT", "")
                 try:
                     borrow_rate = await self.client.margin_interest_rate(base_asset)
