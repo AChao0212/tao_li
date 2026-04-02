@@ -92,14 +92,22 @@ def get_avg_funding_rate(symbol: str, periods: int = 8) -> float | None:
 
 
 async def fetch_market_data(session: aiohttp.ClientSession) -> tuple[list[dict], dict]:
-    """Fetch premiumIndex and 24h ticker data."""
+    """Fetch premiumIndex and 24h ticker data. Raises on API failure."""
     premium_url = f"{BASE_URL}/fapi/v1/premiumIndex"
     ticker_url = f"{BASE_URL}/fapi/v1/ticker/24hr"
 
-    async with session.get(premium_url) as resp:
+    async with session.get(premium_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"premiumIndex API returned {resp.status}")
         premium_data = await resp.json()
-    async with session.get(ticker_url) as resp:
+
+    async with session.get(ticker_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"ticker/24hr API returned {resp.status}")
         ticker_data = await resp.json()
+
+    if not isinstance(premium_data, list) or not isinstance(ticker_data, list):
+        raise RuntimeError(f"Unexpected API response format")
 
     # Build volume lookup
     volume_map = {}
@@ -220,13 +228,17 @@ async def run_scanner(config: SignalConfig | None = None):
 
 
 async def scan_once(config: SignalConfig | None = None) -> list[Signal]:
-    """Run a single scan and return signals (for testing)."""
+    """Run a single scan and return signals. Returns empty list on API failure."""
     if config is None:
         config = SignalConfig()
 
-    async with aiohttp.ClientSession() as session:
-        premium_data, volume_map = await fetch_market_data(session)
-        return generate_signals(premium_data, volume_map, config)
+    try:
+        async with aiohttp.ClientSession() as session:
+            premium_data, volume_map = await fetch_market_data(session)
+            return generate_signals(premium_data, volume_map, config)
+    except Exception as e:
+        log.error(f"Scan failed: {e}")
+        return []
 
 
 if __name__ == "__main__":
