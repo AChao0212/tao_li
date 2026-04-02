@@ -31,9 +31,10 @@ SECRET_PATH = Path.home() / ".secret" / "binance.txt"
 # Timing
 SCAN_INTERVAL = 10              # seconds between scans (when idle)
 PRESCAN_SECONDS = 60            # start watching candidates this many seconds before settlement
-ENTRY_SECONDS_BEFORE = 3        # enter this many seconds before settlement
-EXIT_SECONDS_AFTER = 2          # exit this many seconds after settlement
+ENTRY_SECONDS_BEFORE = 2        # enter this many seconds before settlement
+EXIT_SECONDS_AFTER = 1          # exit this many seconds after settlement
 SAFETY_CHECK_INTERVAL = 120     # seconds between margin safety checks
+HEARTBEAT_INTERVAL = 300        # log heartbeat every 5 minutes
 
 
 def setup_logging():
@@ -100,6 +101,48 @@ class FundingSniper:
         self.sniped_this_period: dict[str, int] = {}  # symbol -> funding_time
 
         self._last_safety = 0.0
+        self._last_heartbeat = 0.0
+
+    async def heartbeat(self):
+        """Log status with next settlement times and top funding rates."""
+        try:
+            data = await self.client._futures_get("/fapi/v1/premiumIndex")
+            now_ms = int(time.time() * 1000)
+
+            # Find next settlement times and top rates
+            funding_times = set()
+            top_rates = []
+            for item in data:
+                sym = item.get("symbol", "")
+                if not sym.endswith("USDT"):
+                    continue
+                nft = item.get("nextFundingTime", 0)
+                rate = float(item.get("lastFundingRate", 0))
+                if nft:
+                    funding_times.add(nft)
+                if abs(rate) >= self.min_rate:
+                    secs = max(0, (nft - now_ms) // 1000)
+                    top_rates.append((sym, rate, secs))
+
+            top_rates.sort(key=lambda x: abs(x[1]), reverse=True)
+
+            # Next settlement
+            next_times = sorted(funding_times)[:3]
+            time_strs = []
+            for t in next_times:
+                secs = max(0, (t - now_ms) // 1000)
+                dt = datetime.fromtimestamp(t / 1000, tz=timezone.utc)
+                time_strs.append(f"{dt.strftime('%H:%M')}UTC({secs // 60}m)")
+
+            log.info(
+                f"[HEARTBEAT] Next settlements: {', '.join(time_strs)} | "
+                f"Candidates (rate>={self.min_rate:.1%}): {len(top_rates)}"
+            )
+            for sym, rate, secs in top_rates[:5]:
+                log.info(f"  {sym:<16} rate={rate:+.4%}  settles_in={secs // 60}m{secs % 60}s")
+
+        except Exception as e:
+            log.error(f"Heartbeat failed: {e}")
 
     async def _get_1m_volatility(self, symbol: str) -> float:
         """Get average 1-minute price change over the last 30 minutes."""
@@ -442,6 +485,11 @@ class FundingSniper:
                                 await self.enter_snipe(opp)
                                 open_count += 1
                                 current_exposure += self.position_usdt
+
+                # Heartbeat
+                if now - self._last_heartbeat > HEARTBEAT_INTERVAL:
+                    await self.heartbeat()
+                    self._last_heartbeat = now
 
                 # Safety check
                 if not self.dry_run and now - self._last_safety > SAFETY_CHECK_INTERVAL:
