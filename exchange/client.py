@@ -455,7 +455,7 @@ class BinanceClient:
         """Borrow an asset from cross margin."""
         data = await self._spot_post("/sapi/v1/margin/loan", {
             "asset": asset,
-            "amount": str(amount),
+            "amount": f"{amount:.8f}",
         })
         log.info(f"MARGIN BORROW {asset} amount={amount}")
         return data
@@ -464,7 +464,7 @@ class BinanceClient:
         """Repay borrowed asset to cross margin."""
         data = await self._spot_post("/sapi/v1/margin/repay", {
             "asset": asset,
-            "amount": str(amount),
+            "amount": f"{amount:.8f}",
         })
         log.info(f"MARGIN REPAY {asset} amount={amount}")
         return data
@@ -513,7 +513,7 @@ class BinanceClient:
         """Transfer asset from spot to cross margin account."""
         return await self._spot_post("/sapi/v1/margin/transfer", {
             "asset": asset,
-            "amount": str(amount),
+            "amount": f"{amount:.8f}",
             "type": "1",  # 1 = spot to margin
         })
 
@@ -521,7 +521,7 @@ class BinanceClient:
         """Transfer asset from cross margin to spot account."""
         return await self._spot_post("/sapi/v1/margin/transfer", {
             "asset": asset,
-            "amount": str(amount),
+            "amount": f"{amount:.8f}",
             "type": "2",  # 2 = margin to spot
         })
 
