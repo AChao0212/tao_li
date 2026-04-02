@@ -199,6 +199,22 @@ class FundingSniper:
     async def enter_snipe(self, opp: dict):
         """Enter a snipe position just before funding settlement."""
         symbol = opp["symbol"]
+
+        # Re-check funding rate right before entry (it may have changed)
+        try:
+            fresh = await self.client._futures_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+            fresh_rate = float(fresh.get("lastFundingRate", 0))
+            fresh_price = float(fresh.get("markPrice", 0))
+            if abs(fresh_rate) < self.min_rate:
+                log.info(f"[ABORT] {symbol}: rate dropped to {fresh_rate:+.4%} (was {opp['rate']:+.4%})")
+                return
+            # Update with fresh data
+            opp["rate"] = fresh_rate
+            opp["mark_price"] = fresh_price if fresh_price > 0 else opp["mark_price"]
+            opp["direction"] = "long" if fresh_rate < 0 else "short"
+        except Exception as e:
+            log.warning(f"[RECHECK FAILED] {symbol}: {e}, using cached rate")
+
         direction = opp["direction"]
         price = opp["mark_price"]
 

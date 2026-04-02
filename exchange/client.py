@@ -408,6 +408,7 @@ class BinanceClient:
             "side": "BUY",
             "type": "MARKET",
             "quantity": str(quantity),
+            "newOrderRespType": "RESULT",  # Get fill info immediately
         }
         data = await self._futures_post("/fapi/v1/order", params)
         order = self._parse_order(data)
@@ -424,6 +425,7 @@ class BinanceClient:
             "side": "SELL",
             "type": "MARKET",
             "quantity": str(quantity),
+            "newOrderRespType": "RESULT",  # Get fill info immediately
         }
         data = await self._futures_post("/fapi/v1/order", params)
         order = self._parse_order(data)
