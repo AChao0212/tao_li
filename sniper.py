@@ -29,9 +29,10 @@ LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 SECRET_PATH = Path.home() / ".secret" / "binance.txt"
 
 # Timing
-SCAN_INTERVAL = 10              # seconds between scans
-ENTRY_SECONDS_BEFORE = 30       # enter this many seconds before settlement
-EXIT_SECONDS_AFTER = 10         # exit this many seconds after settlement
+SCAN_INTERVAL = 10              # seconds between scans (when idle)
+PRESCAN_SECONDS = 60            # start watching candidates this many seconds before settlement
+ENTRY_SECONDS_BEFORE = 3        # enter this many seconds before settlement
+EXIT_SECONDS_AFTER = 2          # exit this many seconds after settlement
 SAFETY_CHECK_INTERVAL = 120     # seconds between margin safety checks
 
 
@@ -153,8 +154,8 @@ class FundingSniper:
 
             seconds_to_funding = max(0, (next_funding - now_ms) // 1000)
 
-            # Only interested if settlement is within entry window
-            if seconds_to_funding > ENTRY_SECONDS_BEFORE + 60:
+            # Only interested if settlement is approaching (within prescan window)
+            if seconds_to_funding > PRESCAN_SECONDS:
                 continue
 
             # Skip if already sniped this period
@@ -167,13 +168,15 @@ class FundingSniper:
             if net_pnl <= 0:
                 continue
 
-            # Volatility filter: funding rate must be > 3x the avg 1-minute volatility
-            # This ensures we're not gambling on price swings larger than our edge
+            # Volatility filter: with ~5s exposure, we only need rate > estimated 5s move
+            # 5s move ≈ avg_1m_vol * sqrt(5/60) ≈ avg_1m_vol * 0.29
+            # Require rate > 3x the 5-second estimated move for safety
             vol = await self._get_1m_volatility(symbol)
-            if abs_rate < vol * 3:
+            vol_5s = vol * 0.29  # Scale 1m vol to 5s
+            if abs_rate < vol_5s * 3:
                 log.info(
-                    f"[VOL SKIP] {symbol}: rate={abs_rate:.4%} < 3x vol={vol:.4%} "
-                    f"(need {vol*3:.4%})"
+                    f"[VOL SKIP] {symbol}: rate={abs_rate:.4%} < 3x vol_5s={vol_5s:.4%} "
+                    f"(vol_1m={vol:.4%})"
                 )
                 continue
 
@@ -386,6 +389,9 @@ class FundingSniper:
                 except Exception as e:
                     log.error(f"[RECOVER FAILED] {sym}: {e}")
 
+        # Track candidates found during prescan
+        candidates: list[dict] = []
+
         while True:
             try:
                 now = time.time()
@@ -395,29 +401,31 @@ class FundingSniper:
 
                 # Scan for new opportunities
                 opps = await self.scan_opportunities()
-                open_count = len(self.positions)
-                current_exposure = open_count * self.position_usdt
 
-                for opp in opps:
-                    if open_count >= self.max_positions:
-                        break
-                    if current_exposure + self.position_usdt > self.max_exposure:
-                        break
-                    if opp["symbol"] in self.positions:
-                        continue
+                if opps:
+                    candidates = opps
+                    nearest = min(o["seconds_to_funding"] for o in opps)
 
-                    # Only enter within the window
-                    if opp["seconds_to_funding"] <= ENTRY_SECONDS_BEFORE:
-                        await self.enter_snipe(opp)
-                        open_count += 1
-                        current_exposure += self.position_usdt
+                    if nearest > ENTRY_SECONDS_BEFORE:
+                        # Not time yet — log what we're watching
+                        symbols = ", ".join(f"{o['symbol']}({o['rate']:+.4%})" for o in opps[:3])
+                        log.info(f"[WATCH] {len(opps)} ready, nearest in {nearest}s: {symbols}")
+                    else:
+                        # GO TIME — enter positions
+                        open_count = len(self.positions)
+                        current_exposure = open_count * self.position_usdt
 
-                if opps and not self.positions:
-                    next_funding = min(o["seconds_to_funding"] for o in opps)
-                    log.debug(
-                        f"[WAIT] {len(opps)} candidates, nearest in {next_funding}s: "
-                        f"{opps[0]['symbol']} rate={opps[0]['rate']:+.4%}"
-                    )
+                        for opp in opps:
+                            if open_count >= self.max_positions:
+                                break
+                            if current_exposure + self.position_usdt > self.max_exposure:
+                                break
+                            if opp["symbol"] in self.positions:
+                                continue
+                            if opp["seconds_to_funding"] <= ENTRY_SECONDS_BEFORE:
+                                await self.enter_snipe(opp)
+                                open_count += 1
+                                current_exposure += self.position_usdt
 
                 # Safety check
                 if not self.dry_run and now - self._last_safety > SAFETY_CHECK_INTERVAL:
@@ -438,9 +446,14 @@ class FundingSniper:
             except Exception as e:
                 log.error(f"Main loop error: {e}", exc_info=True)
 
-            # Adaptive sleep: faster when positions are open or funding is near
+            # Adaptive sleep:
+            #   - 0.5s when in position (waiting to exit)
+            #   - 1s when candidates are near (<10s to entry)
+            #   - 10s when idle
             if self.positions:
-                await asyncio.sleep(2)  # Fast poll when in position
+                await asyncio.sleep(0.5)
+            elif candidates and min(o["seconds_to_funding"] for o in candidates) < ENTRY_SECONDS_BEFORE + 10:
+                await asyncio.sleep(1)
             else:
                 await asyncio.sleep(SCAN_INTERVAL)
 
