@@ -69,11 +69,38 @@ def load_api_keys(dry_run: bool = False) -> tuple[str, str]:
     return api_key, api_secret
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+LOG_DIR = Path(__file__).parent / "logs"
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def setup_logging():
+    """Configure logging to both console and rotating file."""
+    LOG_DIR.mkdir(exist_ok=True)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    # Console handler
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
+    root.addHandler(console)
+
+    # File handler — one file per day, keeps 30 days
+    from logging.handlers import TimedRotatingFileHandler
+    file_handler = TimedRotatingFileHandler(
+        LOG_DIR / "arb.log",
+        when="midnight",
+        backupCount=30,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)  # More detail in file
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
+    root.addHandler(file_handler)
+
+
+setup_logging()
 log = logging.getLogger("arb")
 
 # How often to run the main loop
@@ -116,27 +143,31 @@ class ArbBot:
 
     async def process_signals(self, signals: list[Signal]):
         """Evaluate signals and open positions if risk allows."""
-        for signal in signals:
-            # Only act on signals with positive expected PnL
-            if signal.net_expected_pnl <= 0:
-                continue
+        profitable = [s for s in signals if s.net_expected_pnl > 0]
+        if profitable:
+            log.info(f"[SCAN] {len(signals)} signals, {len(profitable)} profitable")
+            for s in profitable[:5]:
+                log.debug(f"  {s}")
 
+        for signal in profitable:
             symbol = signal.symbol
 
             # Skip if already in position
             if symbol in self.executor.positions and self.executor.positions[symbol].is_open:
+                log.debug(f"Skipping {symbol}: already in position")
                 continue
 
             # Risk check
             allowed, reason = await self.risk.can_open_position(symbol, self.position_usdt, signal.direction)
             if not allowed:
-                log.debug(f"Skipping {symbol}: {reason}")
+                log.info(f"[RISK] Rejected {symbol}: {reason}")
                 continue
 
             if self.dry_run:
                 log.info(
                     f"[DRY RUN] Would open {signal.direction} on {symbol}: "
-                    f"rate={signal.funding_rate:+.4%}, net={signal.net_expected_pnl:+.4%}"
+                    f"rate={signal.funding_rate:+.4%}, net={signal.net_expected_pnl:+.4%}, "
+                    f"avg8={signal.avg_rate_8h:+.4%}"
                 )
                 self._log_trade("dry_open", symbol, {
                     "direction": signal.direction,
@@ -149,8 +180,9 @@ class ArbBot:
             # Open position
             try:
                 log.info(
-                    f"Opening {signal.direction} on {symbol}: "
-                    f"rate={signal.funding_rate:+.4%}, amount=${self.position_usdt}"
+                    f"[OPEN] {signal.direction} on {symbol}: "
+                    f"rate={signal.funding_rate:+.4%}, net={signal.net_expected_pnl:+.4%}, "
+                    f"amount=${self.position_usdt}, type={signal.signal_type}"
                 )
                 pos = await self.executor.open_hedge(
                     symbol=symbol,
@@ -160,12 +192,15 @@ class ArbBot:
                 self._log_trade("open", symbol, {
                     "direction": signal.direction,
                     "quantity": pos.futures_filled_qty,
-                    "price": pos.futures_avg_price,
+                    "spot_price": pos.spot_avg_price,
+                    "futures_price": pos.futures_avg_price,
+                    "basis_spread": pos.basis_spread,
                     "funding_rate": signal.funding_rate,
                     "signal_type": signal.signal_type,
+                    "leverage": pos.sizing.max_leverage if pos.sizing else 1,
                 })
             except Exception as e:
-                log.error(f"Failed to open {symbol}: {e}")
+                log.error(f"[OPEN FAILED] {symbol}: {e}", exc_info=True)
 
     async def check_exit_conditions(self):
         """Check if any open positions should be closed."""
@@ -197,18 +232,26 @@ class ArbBot:
                         should_close = True
                         reason = "Snipe: funding settled"
 
-                if should_close:
-                    if self.dry_run:
-                        log.info(f"[DRY RUN] Would close {symbol}: {reason}")
-                        self._log_trade("dry_close", symbol, {"reason": reason})
-                        # Remove from tracking in dry run
-                        pos.status = "closed"
-                        del self.executor.positions[symbol]
-                        continue
+                if not should_close:
+                    log.debug(
+                        f"[HOLD] {symbol} {pos.direction}: current_rate={current_rate:+.4%}, "
+                        f"threshold={self.signal_config.carry_exit_threshold:.4%}"
+                    )
+                    continue
 
-                    log.info(f"Closing {symbol}: {reason}")
-                    await self.executor.close_hedge(pos)
-                    self._log_trade("close", symbol, {"reason": reason})
+                if self.dry_run:
+                    log.info(f"[DRY CLOSE] {symbol}: {reason}")
+                    self._log_trade("dry_close", symbol, {"reason": reason})
+                    pos.status = "closed"
+                    del self.executor.positions[symbol]
+                    continue
+
+                log.info(f"[CLOSE] {symbol}: {reason}")
+                await self.executor.close_hedge(pos)
+                self._log_trade("close", symbol, {
+                    "reason": reason,
+                    "hold_hours": (time.time() * 1000 - pos.open_time) / 3_600_000,
+                })
 
             except Exception as e:
                 log.error(f"Error checking exit for {symbol}: {e}")
@@ -219,14 +262,15 @@ class ArbBot:
         now = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
         open_count = len(summaries)
-        total_upnl = sum(s.get("unrealized_pnl", 0) for s in summaries)
+        total_upnl = sum(s.get("net_unrealized", 0) for s in summaries)
 
-        print(f"\n[{now}] Positions: {open_count} | uPnL: {total_upnl:+.4f} USDT")
+        log.info(f"[STATUS] Positions: {open_count} | uPnL: {total_upnl:+.4f} USDT")
         for s in summaries:
-            print(
+            log.info(
                 f"  {s['symbol']:<16} {s['direction']:<10} "
-                f"qty={s['quantity']:.4f}  entry={s['entry_price']:.4f}  "
-                f"now={s['current_price']:.4f}  uPnL={s['unrealized_pnl']:+.4f}"
+                f"qty={s['quantity']:.4f}  spot={s['entry_spot']:.4f}  "
+                f"futures={s['entry_futures']:.4f}  now={s['current_price']:.4f}  "
+                f"uPnL={s['net_unrealized']:+.4f}  interest={s['est_interest_paid']:.4f}"
             )
 
     async def run(self):
@@ -236,6 +280,12 @@ class ArbBot:
         log.info(f"Position size: ${self.position_usdt} USDT")
         log.info(f"Max positions: {self.risk.config.max_concurrent_positions}")
         log.info(f"Max exposure: ${self.risk.config.max_total_exposure_usdt}")
+        log.info(f"Leverage: {self.risk.config.max_leverage}x")
+        log.info(f"Carry entry: {self.signal_config.carry_entry_threshold:.4%}")
+        log.info(f"Carry exit: {self.signal_config.carry_exit_threshold:.4%}")
+        log.info(f"Snipe threshold: {self.signal_config.snipe_threshold:.4%}")
+        log.info(f"Round-trip cost: {self.signal_config.round_trip_cost:.4%}")
+        log.info(f"Survival move: {self.risk.config.target_survival_move:.0%}")
         log.info("=" * 60)
 
         # Load symbol info
