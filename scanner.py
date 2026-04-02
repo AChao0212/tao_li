@@ -76,8 +76,8 @@ class Signal:
         )
 
 
-def get_avg_funding_rate(symbol: str, periods: int = 8) -> float:
-    """Get rolling average funding rate for last N periods."""
+def get_avg_funding_rate(symbol: str, periods: int = 8) -> float | None:
+    """Get rolling average funding rate for last N periods. Returns None if no data."""
     conn = get_conn()
     rows = conn.execute(
         """SELECT funding_rate FROM funding_rates
@@ -87,7 +87,7 @@ def get_avg_funding_rate(symbol: str, periods: int = 8) -> float:
     ).fetchall()
     conn.close()
     if not rows:
-        return 0.0
+        return None
     return sum(r["funding_rate"] for r in rows) / len(rows)
 
 
@@ -131,6 +131,10 @@ def generate_signals(
         mark_price = float(item.get("markPrice", 0))
         estimated_rate = float(item.get("interestRate", 0))
 
+        # Skip symbols with invalid price data
+        if mark_price <= 0:
+            continue
+
         volume = volume_map.get(symbol, 0)
         if volume < config.min_volume_usdt:
             continue
@@ -141,6 +145,8 @@ def generate_signals(
         net_pnl = abs_rate - config.round_trip_cost
 
         avg_rate = get_avg_funding_rate(symbol)
+        # If no historical data, use current rate as fallback for avg
+        avg_rate_value = avg_rate if avg_rate is not None else funding_rate
 
         # Snipe signal: extreme rate + close to funding time
         if abs_rate >= config.snipe_threshold and seconds_to_funding <= config.snipe_window_seconds:
@@ -154,12 +160,12 @@ def generate_signals(
                 next_funding_time=next_funding_time,
                 seconds_to_funding=seconds_to_funding,
                 net_expected_pnl=net_pnl,
-                avg_rate_8h=avg_rate,
+                avg_rate_8h=avg_rate_value,
                 timestamp=now_ms,
             ))
 
         # Carry enter signal: sustained high rate
-        elif abs_rate >= config.carry_entry_threshold and abs(avg_rate) >= config.carry_entry_threshold * 0.5:
+        elif abs_rate >= config.carry_entry_threshold and abs(avg_rate_value) >= config.carry_entry_threshold * 0.5:
             signals.append(Signal(
                 symbol=symbol,
                 signal_type="carry_enter",
@@ -170,7 +176,7 @@ def generate_signals(
                 next_funding_time=next_funding_time,
                 seconds_to_funding=seconds_to_funding,
                 net_expected_pnl=net_pnl,
-                avg_rate_8h=avg_rate,
+                avg_rate_8h=avg_rate_value,
                 timestamp=now_ms,
             ))
 

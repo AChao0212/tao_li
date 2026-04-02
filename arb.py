@@ -243,6 +243,12 @@ class ArbBot:
         if not self.dry_run:
             await self.client.load_spot_symbols()
 
+            # Recover any positions from previous run
+            self.executor.recover_positions()
+            if self.executor.positions:
+                log.warning("Found orphaned positions — running safety check")
+                await self.risk.run_safety_check()
+
             # Print initial balances
             spot_bal = await self.client.spot_balances()
             futures_bal = await self.client.futures_balances()

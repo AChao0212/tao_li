@@ -273,6 +273,25 @@ class BinanceClient:
     # ─── Spot orders ────────────────────────────────────────────────────
 
     def _parse_order(self, data: dict) -> Order:
+        # Calculate avg_price: prefer avgPrice, then compute from fills, then cumulativeQuoteQty/executedQty
+        avg_price = float(data.get("avgPrice", 0))
+        filled_qty = float(data.get("executedQty", 0))
+
+        if avg_price <= 0 and filled_qty > 0:
+            # Try to compute from fills
+            fills = data.get("fills", [])
+            if fills:
+                total_cost = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+                total_qty = sum(float(f["qty"]) for f in fills)
+                if total_qty > 0:
+                    avg_price = total_cost / total_qty
+
+        if avg_price <= 0 and filled_qty > 0:
+            # Try cumulativeQuoteQty / executedQty
+            cum_quote = float(data.get("cumulativeQuoteQty", 0))
+            if cum_quote > 0 and filled_qty > 0:
+                avg_price = cum_quote / filled_qty
+
         return Order(
             symbol=data.get("symbol", ""),
             side=OrderSide(data.get("side", "BUY")),
@@ -282,8 +301,8 @@ class BinanceClient:
             order_id=str(data.get("orderId", "")),
             client_order_id=data.get("clientOrderId", ""),
             status=OrderStatus(data.get("status", "NEW")),
-            filled_qty=float(data.get("executedQty", 0)),
-            avg_price=float(data.get("avgPrice", data.get("price", 0))),
+            filled_qty=filled_qty,
+            avg_price=avg_price,
             commission=sum(
                 float(f.get("commission", 0))
                 for f in data.get("fills", [])
