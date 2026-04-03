@@ -159,6 +159,8 @@ class FundingSniper:
         self._exit_tasks: dict[str, asyncio.Task] = {}
         # Guard against double-exit
         self._exiting: set[str] = set()
+        # Symbols already pre-configured (leverage/margin type set)
+        self._preconfigured: set[str] = set()
 
     async def heartbeat(self):
         """Log status with next settlement times and top funding rates."""
@@ -379,8 +381,10 @@ class FundingSniper:
             return
 
         try:
-            await self.client.futures_set_leverage(symbol, 1)
-            await self.client.futures_set_margin_type(symbol, "CROSSED")
+            if symbol not in self._preconfigured:
+                await self.client.futures_set_leverage(symbol, 1)
+                await self.client.futures_set_margin_type(symbol, "CROSSED")
+                self._preconfigured.add(symbol)
 
             if direction == "long":
                 order = await self.client.futures_market_buy(symbol, quantity)
@@ -607,6 +611,18 @@ class FundingSniper:
                         # Not time yet — log what we're watching
                         symbols = ", ".join(f"{o['symbol']}({o['rate']:+.4%})" for o in opps[:3])
                         log.info(f"[WATCH] {len(opps)} ready, nearest in {nearest}s: {symbols}")
+
+                        # Pre-configure futures while we wait (so entry is faster)
+                        if nearest <= ENTRY_SECONDS_BEFORE + 10 and not self.dry_run:
+                            for opp in opps[:self.max_positions]:
+                                sym = opp["symbol"]
+                                if sym not in self.positions and sym not in self._preconfigured:
+                                    try:
+                                        await self.client.futures_set_leverage(sym, 1)
+                                        await self.client.futures_set_margin_type(sym, "CROSSED")
+                                        self._preconfigured.add(sym)
+                                    except Exception:
+                                        pass
                     else:
                         # GO TIME — enter positions in parallel
                         open_count = len(self.positions)
