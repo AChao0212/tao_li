@@ -157,6 +157,8 @@ class FundingSniper:
 
         # Background exit tasks
         self._exit_tasks: dict[str, asyncio.Task] = {}
+        # Guard against double-exit
+        self._exiting: set[str] = set()
 
     async def heartbeat(self):
         """Log status with next settlement times and top funding rates."""
@@ -450,26 +452,29 @@ class FundingSniper:
 
     async def exit_snipe(self, symbol: str):
         """Exit a snipe position after funding settlement."""
+        if symbol in self._exiting:
+            return
         pos = self.positions.get(symbol)
         if not pos:
             return
+        self._exiting.add(symbol)
 
         direction = pos["direction"]
         quantity = pos["quantity"]
 
         log.info(f"[EXIT] {symbol} {direction} qty={quantity:.6f}")
 
-        if pos.get("dry_run"):
-            current_price = pos["entry_price"]  # approximate
-            funding_pnl = abs(pos["rate"]) * self.position_usdt
-            log.info(
-                f"[DRY EXIT] {symbol}: funding_collected~${funding_pnl:.4f} "
-                f"rate={pos['rate']:+.4%}"
-            )
-            del self.positions[symbol]
-            return
-
         try:
+            if pos.get("dry_run"):
+                current_price = pos["entry_price"]  # approximate
+                funding_pnl = abs(pos["rate"]) * self.position_usdt
+                log.info(
+                    f"[DRY EXIT] {symbol}: funding_collected~${funding_pnl:.4f} "
+                    f"rate={pos['rate']:+.4%}"
+                )
+                del self.positions[symbol]
+                return
+
             if direction == "long":
                 order = await self.client.futures_market_sell(symbol, quantity)
             else:
@@ -523,6 +528,8 @@ class FundingSniper:
                     f"Exit failed twice: {e2}\n"
                     f"Position still open on Binance!"
                 )
+        finally:
+            self._exiting.discard(symbol)
 
     async def check_exits(self):
         """Check if any positions should be exited (funding has settled)."""
