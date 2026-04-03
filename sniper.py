@@ -678,10 +678,17 @@ class FundingSniper:
 
             # Adaptive sleep:
             #   - 1s when candidates are near (<10s to entry)
+            #   - 10s when candidates are in prescan window (<120s)
             #   - SCAN_INTERVAL when idle
             #   (exits are handled by scheduled tasks, no need to poll)
-            if candidates and min(o["seconds_to_funding"] for o in candidates) < ENTRY_SECONDS_BEFORE + 10:
-                await asyncio.sleep(1)
+            if candidates:
+                nearest = min(o["seconds_to_funding"] for o in candidates)
+                if nearest < ENTRY_SECONDS_BEFORE + 10:
+                    await asyncio.sleep(1)
+                elif nearest < PRESCAN_SECONDS:
+                    await asyncio.sleep(10)
+                else:
+                    await asyncio.sleep(SCAN_INTERVAL)
             else:
                 await asyncio.sleep(SCAN_INTERVAL)
 
