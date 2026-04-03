@@ -12,6 +12,7 @@ Usage:
 """
 
 import asyncio
+import collections
 import hashlib
 import hmac
 import logging
@@ -39,6 +40,10 @@ FUTURES_BASE = "https://fapi.binance.com"
 RETRYABLE_CODES = {-1001, -1003, -1015, -1021}  # timeout, rate limit, etc.
 MAX_RETRIES = 3
 RETRY_DELAY = 1.0
+RATE_LIMIT_COOLDOWN = 30.0  # seconds to back off on -1003
+
+# Token bucket rate limiter: stay well under 2400 req/min
+MAX_REQUESTS_PER_MINUTE = 1200
 
 
 class BinanceAPIError(Exception):
@@ -64,6 +69,11 @@ class BinanceClient:
         # Symbol info caches
         self._spot_symbols: dict[str, SymbolInfo] = {}
         self._futures_symbols: dict[str, SymbolInfo] = {}
+
+        # Rate limiter: sliding window of request timestamps
+        self._request_times: collections.deque = collections.deque()
+        self._rate_limit_lock = asyncio.Lock()
+        self._rate_limit_until = 0.0  # cooldown after hitting -1003
 
     async def __aenter__(self):
         self._session = aiohttp.ClientSession(
@@ -91,16 +101,43 @@ class BinanceClient:
 
     # ─── HTTP helpers ───────────────────────────────────────────────────
 
+    async def _wait_for_rate_limit(self):
+        """Wait if needed to stay under rate limit."""
+        async with self._rate_limit_lock:
+            now = time.time()
+
+            # Respect cooldown from -1003 errors
+            if now < self._rate_limit_until:
+                wait = self._rate_limit_until - now
+                log.warning(f"Rate limit cooldown: waiting {wait:.1f}s")
+                await asyncio.sleep(wait)
+                now = time.time()
+
+            # Sliding window: remove timestamps older than 60s
+            cutoff = now - 60
+            while self._request_times and self._request_times[0] < cutoff:
+                self._request_times.popleft()
+
+            # If at limit, wait until oldest request expires
+            if len(self._request_times) >= MAX_REQUESTS_PER_MINUTE:
+                wait = self._request_times[0] - cutoff + 0.05
+                if wait > 0:
+                    log.debug(f"Rate limiter: waiting {wait:.2f}s")
+                    await asyncio.sleep(wait)
+
+            self._request_times.append(time.time())
+
     async def _request(
         self, method: str, url: str, params: dict | None = None, signed: bool = False
     ) -> dict:
-        """Make an HTTP request with retry logic."""
+        """Make an HTTP request with retry logic and rate limiting."""
         if params is None:
             params = {}
         if signed:
             params = self._sign(params)
 
         for attempt in range(MAX_RETRIES):
+            await self._wait_for_rate_limit()
             try:
                 async with self._session.request(method, url, params=params) as resp:
                     data = await resp.json()
@@ -108,6 +145,11 @@ class BinanceClient:
                     if isinstance(data, dict) and "code" in data and data["code"] < 0:
                         code = data["code"]
                         msg = data.get("msg", "")
+                        if code == -1003:
+                            # Rate limit hit — set cooldown and raise immediately
+                            self._rate_limit_until = time.time() + RATE_LIMIT_COOLDOWN
+                            log.warning(f"Rate limit hit (-1003), cooling down {RATE_LIMIT_COOLDOWN}s")
+                            raise BinanceAPIError(code, msg)
                         if code in RETRYABLE_CODES and attempt < MAX_RETRIES - 1:
                             log.warning(f"Retryable error {code}: {msg}, attempt {attempt + 1}")
                             await asyncio.sleep(RETRY_DELAY * (attempt + 1))

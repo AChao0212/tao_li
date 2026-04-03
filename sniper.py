@@ -151,6 +151,10 @@ class FundingSniper:
         self._last_safety = 0.0
         self._last_heartbeat = 0.0
 
+        # Volatility cache: symbol -> (timestamp, value)
+        self._vol_cache: dict[str, tuple[float, float]] = {}
+        self._vol_cache_ttl = 60  # seconds
+
     async def heartbeat(self):
         """Log status with next settlement times and top funding rates."""
         try:
@@ -193,7 +197,12 @@ class FundingSniper:
             log.error(f"Heartbeat failed: {e}")
 
     async def _get_1m_volatility(self, symbol: str) -> float:
-        """Get average 1-minute price change over the last 30 minutes."""
+        """Get average 1-minute price change over the last 30 minutes. Cached for 60s."""
+        now = time.time()
+        cached = self._vol_cache.get(symbol)
+        if cached and now - cached[0] < self._vol_cache_ttl:
+            return cached[1]
+
         try:
             data = await self.client._futures_get("/fapi/v1/klines", {
                 "symbol": symbol, "interval": "1m", "limit": 30,
@@ -205,7 +214,9 @@ class FundingSniper:
                 o, c = float(k[1]), float(k[4])
                 if o > 0:
                     changes.append(abs(c - o) / o)
-            return sum(changes) / len(changes) if changes else 999.0
+            vol = sum(changes) / len(changes) if changes else 999.0
+            self._vol_cache[symbol] = (now, vol)
+            return vol
         except Exception:
             return 999.0
 
@@ -539,8 +550,7 @@ class FundingSniper:
                 # Scan for new opportunities
                 opps = await self.scan_opportunities()
 
-                if opps:
-                    candidates = opps
+                candidates = opps if opps else []
                     nearest = min(o["seconds_to_funding"] for o in opps)
 
                     if nearest > ENTRY_SECONDS_BEFORE:

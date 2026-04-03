@@ -128,6 +128,9 @@ class ArbBot:
         self._last_safety_check = 0.0
         self._last_position_check = 0.0
 
+        # Symbols that failed to open — skip them until next restart
+        self._blacklisted: set[str] = set()
+
         # Trade log
         self.trade_log: list[dict] = []
 
@@ -151,6 +154,10 @@ class ArbBot:
 
         for signal in profitable:
             symbol = signal.symbol
+
+            # Skip blacklisted symbols (previously failed to open)
+            if symbol in self._blacklisted:
+                continue
 
             # Skip if already in position
             if symbol in self.executor.positions and self.executor.positions[symbol].is_open:
@@ -201,6 +208,8 @@ class ArbBot:
                 })
             except Exception as e:
                 log.error(f"[OPEN FAILED] {symbol}: {e}", exc_info=True)
+                self._blacklisted.add(symbol)
+                log.info(f"[BLACKLIST] {symbol} — will skip until restart")
 
     async def check_exit_conditions(self):
         """Check if any open positions should be closed."""

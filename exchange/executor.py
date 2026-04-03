@@ -427,11 +427,7 @@ class HedgeExecutor:
         except Exception:
             # If open failed after transfer, try to get collateral back
             if transferred and pos.spot_filled_qty == 0:
-                try:
-                    await self.client.transfer_margin_to_spot("USDT", collateral)
-                    log.info(f"Recovered {collateral:.2f} USDT from margin after failed open")
-                except Exception as te:
-                    log.error(f"Failed to recover margin collateral: {te}")
+                await self._recover_margin_usdt()
             raise
 
     async def close_hedge(self, pos: HedgePosition) -> HedgePosition:

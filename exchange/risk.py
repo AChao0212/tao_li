@@ -111,8 +111,11 @@ class RiskManager:
         if self.dry_run:
             return True, "OK (dry run)"
 
-        # Check borrow interest for negative direction
+        # Check margin tradability and borrow interest for negative direction
         if direction == "negative":
+            if not self.client.is_margin_tradable(symbol):
+                return False, f"{symbol} not available for margin trading"
+
             base_asset = symbol.replace("USDT", "")
             try:
                 rate = await self.client.margin_interest_rate(base_asset)
@@ -121,6 +124,10 @@ class RiskManager:
                         f"Borrow interest too high: {rate:.4%}/day > "
                         f"max {self.config.max_borrow_interest_daily:.4%}/day"
                     )
+            except BinanceAPIError as e:
+                if e.code == -11027:
+                    return False, f"{base_asset} not supported for margin borrowing"
+                log.warning(f"Cannot check borrow rate for {base_asset}: {e}")
             except Exception as e:
                 log.warning(f"Cannot check borrow rate for {base_asset}: {e}")
 
