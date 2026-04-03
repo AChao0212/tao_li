@@ -83,10 +83,8 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return bool(self.bot_token and self.chat_id)
 
-    async def send(self, message: str):
-        """Send a message. Non-blocking, never raises."""
-        if not self.enabled:
-            return
+    async def _do_send(self, message: str):
+        """Actually send the message."""
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
             async with aiohttp.ClientSession() as session:
@@ -97,6 +95,12 @@ class TelegramNotifier:
                 }, timeout=aiohttp.ClientTimeout(total=5))
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
+
+    async def send(self, message: str):
+        """Fire-and-forget: schedule send without blocking the caller."""
+        if not self.enabled:
+            return
+        asyncio.create_task(self._do_send(message))
 
 
 telegram = TelegramNotifier()
