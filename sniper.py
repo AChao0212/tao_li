@@ -33,7 +33,7 @@ TELEGRAM_PATH = Path.home() / ".secret" / "telegram.txt"
 SCAN_INTERVAL = 60              # seconds between scans (when idle, far from settlement)
 PRESCAN_SECONDS = 120           # start watching candidates this many seconds before settlement
 ENTRY_SECONDS_BEFORE = 2        # enter this many seconds before settlement
-EXIT_SECONDS_AFTER = 0.05       # exit this many seconds after settlement
+EXIT_SECONDS_AFTER = 0.07       # exit this many seconds after settlement
 SAFETY_CHECK_INTERVAL = 120     # seconds between margin safety checks
 HEARTBEAT_INTERVAL = 300        # log heartbeat every 5 minutes
 
