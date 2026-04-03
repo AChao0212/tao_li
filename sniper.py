@@ -155,6 +155,9 @@ class FundingSniper:
         self._vol_cache: dict[str, tuple[float, float]] = {}
         self._vol_cache_ttl = 60  # seconds
 
+        # Background exit tasks
+        self._exit_tasks: dict[str, asyncio.Task] = {}
+
     async def heartbeat(self):
         """Log status with next settlement times and top funding rates."""
         try:
@@ -299,8 +302,15 @@ class FundingSniper:
         return opportunities
 
     async def enter_snipe(self, opp: dict):
-        """Enter a snipe position just before funding settlement."""
+        """Enter a snipe position just before funding settlement.
+        After successful entry, schedules an automatic exit task."""
         symbol = opp["symbol"]
+        now_ms = int(time.time() * 1000)
+
+        # Abort if settlement already passed
+        if now_ms >= opp["next_funding"]:
+            log.info(f"[ABORT] {symbol}: settlement already passed")
+            return
 
         # Re-check funding rate right before entry (it may have changed)
         try:
@@ -310,12 +320,17 @@ class FundingSniper:
             if abs(fresh_rate) < self.min_rate:
                 log.info(f"[ABORT] {symbol}: rate dropped to {fresh_rate:+.4%} (was {opp['rate']:+.4%})")
                 return
-            # Update with fresh data
             opp["rate"] = fresh_rate
             opp["mark_price"] = fresh_price if fresh_price > 0 else opp["mark_price"]
             opp["direction"] = "long" if fresh_rate < 0 else "short"
         except Exception as e:
             log.warning(f"[RECHECK FAILED] {symbol}: {e}, using cached rate")
+
+        # Abort again after re-check (API call took time)
+        now_ms = int(time.time() * 1000)
+        if now_ms >= opp["next_funding"]:
+            log.info(f"[ABORT] {symbol}: settlement passed during re-check")
+            return
 
         direction = opp["direction"]
         price = opp["mark_price"]
@@ -357,6 +372,8 @@ class FundingSniper:
                 "dry_run": True,
             }
             self.sniped_this_period[symbol] = opp["next_funding"]
+            # Schedule dry exit
+            self._schedule_exit(symbol, opp["next_funding"])
             return
 
         try:
@@ -384,7 +401,6 @@ class FundingSniper:
             }
             self.sniped_this_period[symbol] = opp["next_funding"]
 
-            # Persist for crash recovery
             save_position({
                 "symbol": symbol, "direction": direction, "status": "open",
                 "quantity": order.filled_qty,
@@ -403,9 +419,34 @@ class FundingSniper:
                 f"avg={order.avg_price:.4f}"
             )
 
+            # Schedule exit immediately after fill
+            self._schedule_exit(symbol, opp["next_funding"])
+
         except Exception as e:
             log.error(f"[ENTER FAILED] {symbol}: {e}", exc_info=True)
             await telegram.send(f"🚨 <b>ENTER FAILED</b> {symbol}: {e}")
+
+    def _schedule_exit(self, symbol: str, funding_time_ms: int):
+        """Spawn a background task to exit at funding_time + EXIT_SECONDS_AFTER."""
+        async def _auto_exit():
+            try:
+                # Wait until funding_time + exit delay
+                target_ms = funding_time_ms + EXIT_SECONDS_AFTER * 1000
+                now_ms = int(time.time() * 1000)
+                wait_s = max(0, (target_ms - now_ms) / 1000)
+                if wait_s > 0:
+                    log.info(f"[EXIT SCHEDULED] {symbol}: will exit in {wait_s:.1f}s")
+                    await asyncio.sleep(wait_s)
+                await self.exit_snipe(symbol)
+            except Exception as e:
+                log.error(f"[AUTO EXIT FAILED] {symbol}: {e}", exc_info=True)
+            finally:
+                self._exit_tasks.pop(symbol, None)
+
+        # Cancel any existing exit task for this symbol
+        if symbol in self._exit_tasks:
+            self._exit_tasks[symbol].cancel()
+        self._exit_tasks[symbol] = asyncio.create_task(_auto_exit())
 
     async def exit_snipe(self, symbol: str):
         """Exit a snipe position after funding settlement."""
@@ -544,7 +585,7 @@ class FundingSniper:
             try:
                 now = time.time()
 
-                # Exit any positions past their funding time
+                # Fallback: exit any positions that missed their scheduled exit
                 await self.check_exits()
 
                 # Scan for new opportunities
@@ -560,10 +601,11 @@ class FundingSniper:
                         symbols = ", ".join(f"{o['symbol']}({o['rate']:+.4%})" for o in opps[:3])
                         log.info(f"[WATCH] {len(opps)} ready, nearest in {nearest}s: {symbols}")
                     else:
-                        # GO TIME — enter positions
+                        # GO TIME — enter positions in parallel
                         open_count = len(self.positions)
                         current_exposure = open_count * self.position_usdt
 
+                        to_enter = []
                         for opp in opps:
                             if open_count >= self.max_positions:
                                 break
@@ -572,9 +614,16 @@ class FundingSniper:
                             if opp["symbol"] in self.positions:
                                 continue
                             if opp["seconds_to_funding"] <= ENTRY_SECONDS_BEFORE:
-                                await self.enter_snipe(opp)
+                                to_enter.append(opp)
                                 open_count += 1
                                 current_exposure += self.position_usdt
+
+                        if to_enter:
+                            # Enter all positions simultaneously
+                            await asyncio.gather(
+                                *(self.enter_snipe(opp) for opp in to_enter),
+                                return_exceptions=True,
+                            )
 
                 # Heartbeat
                 if now - self._last_heartbeat > HEARTBEAT_INTERVAL:
@@ -605,12 +654,10 @@ class FundingSniper:
                 log.error(f"Main loop error: {e}", exc_info=True)
 
             # Adaptive sleep:
-            #   - 0.5s when in position (waiting to exit)
             #   - 1s when candidates are near (<10s to entry)
-            #   - 10s when idle
-            if self.positions:
-                await asyncio.sleep(0.5)
-            elif candidates and min(o["seconds_to_funding"] for o in candidates) < ENTRY_SECONDS_BEFORE + 10:
+            #   - SCAN_INTERVAL when idle
+            #   (exits are handled by scheduled tasks, no need to poll)
+            if candidates and min(o["seconds_to_funding"] for o in candidates) < ENTRY_SECONDS_BEFORE + 10:
                 await asyncio.sleep(1)
             else:
                 await asyncio.sleep(SCAN_INTERVAL)
