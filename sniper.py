@@ -551,6 +551,8 @@ class FundingSniper:
                 opps = await self.scan_opportunities()
 
                 candidates = opps if opps else []
+
+                if opps:
                     nearest = min(o["seconds_to_funding"] for o in opps)
 
                     if nearest > ENTRY_SECONDS_BEFORE:
