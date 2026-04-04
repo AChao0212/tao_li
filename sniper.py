@@ -495,22 +495,18 @@ class FundingSniper:
                 else:
                     price_pnl = (pos["entry_price"] - order.avg_price) * order.filled_qty
 
-                funding_pnl = abs(pos["rate"]) * pos["entry_price"] * quantity
-                total_fees = pos["entry_price"] * quantity * 0.0004 * 2  # taker both sides
-
-                net = price_pnl + funding_pnl - total_fees
+                commission = order.commission
                 log.info(
                     f"[CLOSED] {symbol}: price_pnl=${price_pnl:+.4f} "
-                    f"funding~${funding_pnl:.4f} fees~${total_fees:.4f} "
-                    f"net~${net:+.4f}"
+                    f"commission=${commission:.4f} "
+                    f"entry={pos['entry_price']:.6f} exit={order.avg_price:.6f}"
                 )
-                emoji = "✅" if net > 0 else "⚠️"
                 await telegram.send(
-                    f"{emoji} <b>CLOSED</b> {symbol}\n"
+                    f"{'✅' if price_pnl > 0 else '📉'} <b>CLOSED</b> {symbol}\n"
                     f"Price PnL: ${price_pnl:+.4f}\n"
-                    f"Funding:   ~${funding_pnl:.4f}\n"
-                    f"Fees:      ~${total_fees:.4f}\n"
-                    f"<b>Net: ${net:+.4f}</b>"
+                    f"Commission: ${commission:.4f}\n"
+                    f"Entry: {pos['entry_price']:.6f} → Exit: {order.avg_price:.6f}\n"
+                    f"<i>Funding credited separately by Binance</i>"
                 )
 
             delete_position(symbol)
