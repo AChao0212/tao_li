@@ -363,11 +363,6 @@ class FundingSniper:
             f"vol_1m={opp.get('volatility_1m', 0):.4%} "
             f"funding_in={opp['seconds_to_funding']}s"
         )
-        await telegram.send(
-            f"⚡ <b>SNIPE {direction.upper()}</b> {symbol}\n"
-            f"Rate: {opp['rate']:+.4%} | Net: {opp['net_pnl']:+.4%}\n"
-            f"Qty: {quantity:.4f} | ~${quantity * price:.2f}"
-        )
 
         if self.dry_run:
             self.positions[symbol] = {
@@ -397,7 +392,6 @@ class FundingSniper:
 
             if order.filled_qty <= 0 or order.avg_price <= 0:
                 log.error(f"[ENTER FAILED] {symbol}: not filled (qty={order.filled_qty})")
-                await telegram.send(f"🚨 <b>ENTER FAILED</b> {symbol}: order not filled")
                 return
 
             self.positions[symbol] = {
@@ -434,7 +428,6 @@ class FundingSniper:
 
         except Exception as e:
             log.error(f"[ENTER FAILED] {symbol}: {e}", exc_info=True)
-            await telegram.send(f"🚨 <b>ENTER FAILED</b> {symbol}: {e}")
 
     def _schedule_exit(self, symbol: str, funding_time_ms: int):
         """Spawn a background task to exit at funding_time + EXIT_SECONDS_AFTER."""
@@ -452,11 +445,81 @@ class FundingSniper:
                 log.error(f"[AUTO EXIT FAILED] {symbol}: {e}", exc_info=True)
             finally:
                 self._exit_tasks.pop(symbol, None)
+                # If all exits done, send summary with real Binance data
+                if not self._exit_tasks and not self.positions:
+                    await self._send_trade_summary(funding_time_ms)
 
         # Cancel any existing exit task for this symbol
         if symbol in self._exit_tasks:
             self._exit_tasks[symbol].cancel()
         self._exit_tasks[symbol] = asyncio.create_task(_auto_exit())
+
+    async def _send_trade_summary(self, funding_time_ms: int):
+        """Fetch real P&L from Binance and send telegram summary. Called after all exits."""
+        try:
+            # Wait a few seconds for Binance to finalize funding fees
+            await asyncio.sleep(5)
+
+            income = await self.client._futures_get(
+                "/fapi/v1/income", {"limit": 50}, signed=True
+            )
+            # Filter to entries near this funding time (within 30s)
+            nearby = [
+                i for i in income
+                if abs(i["time"] - funding_time_ms) < 30000
+            ]
+
+            # Group by symbol
+            symbols = {}
+            for i in nearby:
+                sym = i.get("symbol", "")
+                if not sym:
+                    continue
+                if sym not in symbols:
+                    symbols[sym] = {"funding": 0, "commission": 0, "realized": 0}
+                amount = float(i["income"])
+                if i["incomeType"] == "FUNDING_FEE":
+                    symbols[sym]["funding"] += amount
+                elif i["incomeType"] == "COMMISSION":
+                    symbols[sym]["commission"] += amount
+                elif i["incomeType"] == "REALIZED_PNL":
+                    symbols[sym]["realized"] += amount
+
+            if not symbols:
+                return
+
+            # Build summary message
+            lines = ["📊 <b>Trade Summary</b> (Binance data)\n"]
+            total_funding = 0
+            total_price = 0
+            total_fee = 0
+            for sym, d in symbols.items():
+                net = d["funding"] + d["commission"] + d["realized"]
+                total_funding += d["funding"]
+                total_price += d["realized"]
+                total_fee += d["commission"]
+                emoji = "✅" if net > 0 else "❌"
+                lines.append(
+                    f"{emoji} <b>{sym}</b>\n"
+                    f"  Funding: ${d['funding']:+.4f}\n"
+                    f"  Price: ${d['realized']:+.4f}\n"
+                    f"  Fee: ${d['commission']:.4f}\n"
+                    f"  Net: ${net:+.4f}"
+                )
+
+            total_net = total_funding + total_price + total_fee
+            lines.append(
+                f"\n<b>Total: ${total_net:+.4f}</b>"
+                f" (funding ${total_funding:+.4f}"
+                f" price ${total_price:+.4f}"
+                f" fee ${total_fee:.4f})"
+            )
+
+            await telegram.send("\n".join(lines))
+            log.info(f"[SUMMARY] Sent trade summary: net=${total_net:+.4f}")
+
+        except Exception as e:
+            log.error(f"Failed to send trade summary: {e}")
 
     async def exit_snipe(self, symbol: str):
         """Exit a snipe position after funding settlement."""
@@ -501,20 +564,12 @@ class FundingSniper:
                     f"commission=${commission:.4f} "
                     f"entry={pos['entry_price']:.6f} exit={order.avg_price:.6f}"
                 )
-                await telegram.send(
-                    f"{'✅' if price_pnl > 0 else '📉'} <b>CLOSED</b> {symbol}\n"
-                    f"Price PnL: ${price_pnl:+.4f}\n"
-                    f"Commission: ${commission:.4f}\n"
-                    f"Entry: {pos['entry_price']:.6f} → Exit: {order.avg_price:.6f}\n"
-                    f"<i>Funding credited separately by Binance</i>"
-                )
 
             delete_position(symbol)
             del self.positions[symbol]
 
         except Exception as e:
             log.error(f"[EXIT FAILED] {symbol}: {e}", exc_info=True)
-            await telegram.send(f"🚨 <b>EXIT FAILED</b> {symbol}: {e}")
             # Retry once
             try:
                 await asyncio.sleep(2)
