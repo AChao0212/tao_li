@@ -345,6 +345,17 @@ class BinanceClient:
             if cum_quote > 0 and filled_qty > 0:
                 avg_price = cum_quote / filled_qty
 
+        # Commission: from fills array (spot) or estimate from cumQuote (futures)
+        commission = sum(
+            float(f.get("commission", 0))
+            for f in data.get("fills", [])
+        )
+        if commission <= 0 and filled_qty > 0:
+            # Futures RESULT response has no fills — estimate from notional * taker fee
+            cum_quote = float(data.get("cumQuote", data.get("cumulativeQuoteQty", 0)))
+            if cum_quote > 0:
+                commission = cum_quote * 0.0004  # taker fee estimate
+
         return Order(
             symbol=data.get("symbol", ""),
             side=OrderSide(data.get("side", "BUY")),
@@ -356,10 +367,7 @@ class BinanceClient:
             status=OrderStatus(data.get("status", "NEW")),
             filled_qty=filled_qty,
             avg_price=avg_price,
-            commission=sum(
-                float(f.get("commission", 0))
-                for f in data.get("fills", [])
-            ),
+            commission=commission,
             timestamp=data.get("transactTime", data.get("updateTime", 0)),
             raw=data,
         )
