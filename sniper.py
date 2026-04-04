@@ -22,7 +22,7 @@ from logging.handlers import TimedRotatingFileHandler
 import aiohttp
 
 from config import BASE_URL
-from db import init_db, save_position, delete_position, load_open_positions
+from db import init_db, save_position, delete_position, load_open_positions, save_settlement_impact
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -165,6 +165,10 @@ class FundingSniper:
         self._exiting: set[str] = set()
         # Symbols already pre-configured (leverage/margin type set)
         self._preconfigured: set[str] = set()
+        # Track settlements we've already collected impact data for
+        self._collected_settlements: set[int] = set()
+        # Track candidates at each settlement for impact collection
+        self._last_candidates: list[tuple[str, float]] = []  # [(symbol, rate), ...]
 
     async def heartbeat(self):
         """Log status with next settlement times and top funding rates."""
@@ -244,6 +248,38 @@ class FundingSniper:
 
         volume_map = {t["symbol"]: float(t.get("quoteVolume", 0)) for t in ticker_data}
         opportunities = []
+
+        # Collect settlement impact data for high-rate symbols
+        # Look for symbols that just settled (nextFundingTime far in future, rate was high)
+        for item in premium_data:
+            sym = item.get("symbol", "")
+            if not sym.endswith("USDT"):
+                continue
+            rate = float(item.get("lastFundingRate", 0))
+            nft = item.get("nextFundingTime", 0)
+            if abs(rate) >= self.min_rate and nft:
+                # Estimate last funding time (previous settlement)
+                # Standard 8h = 28800000ms, but some are 4h/1h
+                time_to_next = nft - now_ms
+                if 3500000 < time_to_next < 30000000:  # 1h-8h to next = just settled
+                    # Rough estimate of last settlement
+                    intervals = [3600000, 14400000, 28800000]
+                    for iv in intervals:
+                        candidate_ft = nft - iv
+                        if abs(candidate_ft - now_ms) < 120000:  # within 2 min of now
+                            if candidate_ft not in self._collected_settlements:
+                                self._collected_settlements.add(candidate_ft)
+                                self._last_candidates.append((sym, rate))
+
+        # Launch collection if we found new settlements
+        if self._last_candidates:
+            candidates_to_collect = self._last_candidates[:]
+            # Find the settlement time (approximate)
+            ft_approx = int(now_ms / 3600000) * 3600000  # round to hour
+            self._last_candidates.clear()
+            asyncio.create_task(
+                self._collect_settlement_impact(ft_approx, candidates_to_collect)
+            )
 
         for item in premium_data:
             symbol = item.get("symbol", "")
@@ -520,6 +556,77 @@ class FundingSniper:
 
         except Exception as e:
             log.error(f"Failed to send trade summary: {e}")
+
+    async def _collect_settlement_impact(self, funding_time_ms: int, symbols_and_rates: list[tuple[str, float]]):
+        """Collect price impact data around a settlement for analysis.
+        Called as background task ~35s after settlement."""
+        try:
+            await asyncio.sleep(35)  # Wait for T+30s price data to be available
+
+            for symbol, rate in symbols_and_rates:
+                try:
+                    trades = await self.client._futures_get("/fapi/v1/aggTrades", {
+                        "symbol": symbol,
+                        "startTime": funding_time_ms - 5000,
+                        "endTime": funding_time_ms + 35000,
+                        "limit": 1000,
+                    })
+
+                    if not isinstance(trades, list) or len(trades) < 5:
+                        continue
+
+                    # Bucket by second offset from funding time
+                    sec_data = {}
+                    for t in trades:
+                        sec = (t["T"] - funding_time_ms) // 1000
+                        price = float(t["p"])
+                        qty = float(t["q"])
+                        is_sell = t["m"]
+                        if sec not in sec_data:
+                            sec_data[sec] = {"price": price, "buy_vol": 0, "sell_vol": 0}
+                        sec_data[sec]["price"] = price  # last price in that second
+                        if is_sell:
+                            sec_data[sec]["sell_vol"] += qty
+                        else:
+                            sec_data[sec]["buy_vol"] += qty
+
+                    p_before = sec_data.get(-2, {}).get("price")
+                    p_at = sec_data.get(0, {}).get("price")
+                    p_3 = sec_data.get(3, sec_data.get(2, {})).get("price")
+                    p_10 = sec_data.get(10, sec_data.get(9, {})).get("price")
+                    p_30 = sec_data.get(30, sec_data.get(29, sec_data.get(28, {}))).get("price")
+
+                    sell_vol = sum(d["sell_vol"] for s, d in sec_data.items() if 0 <= s <= 3)
+                    buy_vol = sum(d["buy_vol"] for s, d in sec_data.items() if 0 <= s <= 3)
+
+                    dump_pct = (p_at - p_before) / p_before if p_before and p_at else None
+                    recovery_pct = (p_10 - p_at) / p_at if p_at and p_10 else None
+
+                    save_settlement_impact({
+                        "symbol": symbol,
+                        "funding_time": funding_time_ms,
+                        "funding_rate": rate,
+                        "price_before": p_before,
+                        "price_at": p_at,
+                        "price_after_3s": p_3,
+                        "price_after_10s": p_10,
+                        "price_after_30s": p_30,
+                        "sell_volume_0_3": sell_vol,
+                        "buy_volume_0_3": buy_vol,
+                        "dump_pct": dump_pct,
+                        "recovery_pct": recovery_pct,
+                    })
+                    log.info(
+                        f"[IMPACT] {symbol}: rate={rate:+.4%} "
+                        f"dump={dump_pct:+.4%} recovery={recovery_pct:+.4%}"
+                        if dump_pct and recovery_pct else
+                        f"[IMPACT] {symbol}: insufficient data"
+                    )
+                except Exception as e:
+                    log.warning(f"[IMPACT] Failed to collect {symbol}: {e}")
+
+        except Exception as e:
+            log.error(f"Settlement impact collection failed: {e}")
 
     async def exit_snipe(self, symbol: str):
         """Exit a snipe position after funding settlement."""

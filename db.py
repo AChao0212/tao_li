@@ -40,6 +40,25 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_snapshots_symbol
             ON snapshots(symbol);
 
+        CREATE TABLE IF NOT EXISTS settlement_impact (
+            symbol          TEXT    NOT NULL,
+            funding_time    INTEGER NOT NULL,
+            funding_rate    REAL    NOT NULL,
+            price_before    REAL,   -- last trade price at T-2s
+            price_at        REAL,   -- last trade price at T+0s
+            price_after_3s  REAL,   -- last trade price at T+3s
+            price_after_10s REAL,   -- last trade price at T+10s
+            price_after_30s REAL,   -- last trade price at T+30s
+            sell_volume_0_3 REAL,   -- total sell volume T+0 to T+3
+            buy_volume_0_3  REAL,   -- total buy volume T+0 to T+3
+            dump_pct        REAL,   -- (price_at - price_before) / price_before
+            recovery_pct    REAL,   -- (price_after_10s - price_at) / price_at
+            PRIMARY KEY (symbol, funding_time)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_settlement_symbol
+            ON settlement_impact(symbol);
+
         CREATE TABLE IF NOT EXISTS positions (
             symbol          TEXT    PRIMARY KEY,
             direction       TEXT    NOT NULL,
@@ -126,6 +145,35 @@ def load_open_positions() -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
         "SELECT * FROM positions WHERE status IN ('open', 'closing', 'failed_unwind')"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def save_settlement_impact(data: dict):
+    """Save settlement price impact data."""
+    conn = get_conn()
+    conn.execute(
+        """INSERT OR REPLACE INTO settlement_impact
+           (symbol, funding_time, funding_rate, price_before, price_at,
+            price_after_3s, price_after_10s, price_after_30s,
+            sell_volume_0_3, buy_volume_0_3, dump_pct, recovery_pct)
+           VALUES (:symbol, :funding_time, :funding_rate, :price_before, :price_at,
+                   :price_after_3s, :price_after_10s, :price_after_30s,
+                   :sell_volume_0_3, :buy_volume_0_3, :dump_pct, :recovery_pct)""",
+        data,
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_settlement_stats(symbol: str, limit: int = 20) -> list[dict]:
+    """Get recent settlement impact data for a symbol."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT * FROM settlement_impact
+           WHERE symbol = ? ORDER BY funding_time DESC LIMIT ?""",
+        (symbol, limit),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
